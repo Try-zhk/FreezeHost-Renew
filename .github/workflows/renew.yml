@@ -8,9 +8,10 @@ on:
         description: "AFK 刷币数量（枚，默认 10）"
         required: false
         default: '10'
-  schedule:
-    # 备用：GitHub 原生定时（外部 cron 面板触发 workflow_dispatch 为主）
-    - cron: '0 2 * * *'
+  # schedule 已停用：主跑迁移到自有 AWS 服务器（systemd 定时，随机拉起）。
+  # GitHub 只保留 workflow_dispatch 手动触发；要恢复 GitHub 定时把下面两行注释打开
+  # schedule:
+  #   - cron: '0 2 * * *'
 
 # 同一时刻只跑一个：外部定时重复触发时排队而不是并发
 concurrency:
