@@ -116,15 +116,23 @@ jobs:
             fi
 
             echo "✅ [$ROLE] sing-box 已启动，测试代理连通性..."
-            # 连通性以"非 CF 站点（AWS）"为准，失败再回退 ipify；CF 站点只做信息提示
-            if OUT=$(curl -sS -m 12 --proxy http://127.0.0.1:8080 https://checkip.amazonaws.com) \
-               || OUT=$(curl -sS -m 12 --proxy http://127.0.0.1:8080 https://api.ipify.org); then
-              OUT=$(echo "$OUT" | tr -d '[:space:]')
-              if [ -z "$OUT" ]; then
-                echo "❌ [$ROLE] 代理连接成功，但出口 IP 接口未返回内容。"
-                tail -n 20 singbox.log | mask_ip
-                return 1
+            # 连通性以"非 CF 站点（AWS）"为准，失败再回退 ipify；CF 站点只做信息提示。
+            # 连测 3 次（部分 CDN 对数据中心 IP 有瞬断/限速，重试能捞回来）
+            OUT=""
+            CURL_STATUS=0
+            for try in 1 2 3; do
+              OUT=$(curl -sS -m 12 --proxy http://127.0.0.1:8080 https://checkip.amazonaws.com 2>/dev/null)
+              CURL_STATUS=$?
+              if [ -z "$(echo "$OUT" | tr -d '[:space:]')" ]; then
+                OUT=$(curl -sS -m 12 --proxy http://127.0.0.1:8080 https://api.ipify.org 2>/dev/null)
+                CURL_STATUS=$?
               fi
+              [ -n "$(echo "$OUT" | tr -d '[:space:]')" ] && break
+              echo "🔁 [$ROLE] 连通性第 $try/3 次失败（curl exit $CURL_STATUS），5s 后重试..."
+              sleep 5
+            done
+            if [ -n "$(echo "$OUT" | tr -d '[:space:]')" ]; then
+              OUT=$(echo "$OUT" | tr -d '[:space:]')
               echo "✅ [$ROLE] 出口 IP（非 CF 站点，已脱敏）：$(echo "$OUT" | mask_ip)"
 
               CF=$(curl -sS -m 10 --proxy http://127.0.0.1:8080 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
@@ -137,8 +145,7 @@ jobs:
               fi
               return 0
             else
-              CURL_STATUS=$?
-              echo "❌ [$ROLE] 代理连通性测试失败，curl exit code: $CURL_STATUS"
+              echo "❌ [$ROLE] 代理连通性测试失败（重试 3 次，最后 curl exit $CURL_STATUS）"
               tail -n 20 singbox.log | mask_ip
               return 1
             fi
