@@ -1,0 +1,242 @@
+name: FreezeHost-Daily
+
+on:
+  # 由外部定时（cron 面板）通过 workflow_dispatch 触发；手动触发时可指定刷币数量
+  workflow_dispatch:
+    inputs:
+      afk_coins:
+        description: "AFK 刷币数量（枚，默认 10）"
+        required: false
+        default: '10'
+  schedule:
+    # 备用：GitHub 原生定时（外部 cron 面板触发 workflow_dispatch 为主）
+    - cron: '0 2 * * *'
+
+# 同一时刻只跑一个：外部定时重复触发时排队而不是并发
+concurrency:
+  group: freezehost-renew
+  cancel-in-progress: false
+
+jobs:
+  daily:
+    runs-on: ubuntu-24.04
+    # 默认 10 币约 15 分钟即可跑完；手动触发大金币数（如 100 币≈2 小时）或
+    # 主用失败切备用重跑一轮时都能装下，上限放到 350 分钟
+    timeout-minutes: 350
+
+    steps:
+      - name: 📥 拉取私库脚本
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/FreezeHost-Renew-Private
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: private
+
+      - name: 📂 复制脚本到工作目录
+        run: |
+          cp private/freezehost_renew.py freezehost_renew.py
+          cp private/linktosb.py linktosb.py
+
+      - name: 🐍 安装 Python 依赖
+        run: pip install requests patchright pynacl --quiet
+
+      - name: 🌐 安装浏览器依赖（patchright + 真 Chrome，过盾/AFK 用）
+        run: |
+          # ubuntu-24.04 自带 Google Chrome，缺了才补装（省时间）
+          google-chrome --version || python -m patchright install --with-deps chrome
+          command -v xvfb-run >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq xvfb; }
+
+      - name: 🛡️ 启动 sing-box 代理转发（主用，不可用时自动切备用）
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          PROXY_URL_BACKUP: ${{ secrets.PROXY_URL_BACKUP }}
+        run: |
+          if [ -z "$PROXY_URL" ]; then
+            echo "ℹ️ 未设置 PROXY_URL，跳过 sing-box 代理启动（直连模式）。"
+            exit 0
+          fi
+
+          echo "📦 在私库里查找 sing-box 压缩包..."
+          SB_ARCHIVE=$(ls private/sing-box-*-linux-amd64.tar.gz 2>/dev/null | head -n1)
+          if [ -z "$SB_ARCHIVE" ]; then
+            echo "❌ 私库里没找到 sing-box-*-linux-amd64.tar.gz，请检查是否已上传。"
+            exit 1
+          fi
+          MATCH_COUNT=$(ls private/sing-box-*-linux-amd64.tar.gz 2>/dev/null | wc -l)
+          if [ "$MATCH_COUNT" -gt 1 ]; then
+            echo "⚠️  私库里有多个 sing-box 压缩包，取到的是: $SB_ARCHIVE（建议只保留一个版本）"
+          fi
+          echo "📦 使用: $SB_ARCHIVE"
+
+          mkdir -p sb_extract
+          tar -xzf "$SB_ARCHIVE" --strip-components=1 -C sb_extract
+          cp sb_extract/sing-box ./sing-box
+          chmod +x ./sing-box
+          ./sing-box version
+
+          # 代理启动函数写成文件，供「执行每日任务」步骤在主用失败后切换备用时复用
+          cat > proxy_lib.sh <<'SH'
+          # 用法: start_proxy <线路名> <代理链接>   成功返回 0，失败返回 1
+          mask_ip() { sed -E 's/([0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+/\1.**/g'; }
+
+          start_proxy() {
+            local ROLE="$1" URL="$2" PID OUT CURL_STATUS i
+            pkill -f "sing-box run" >/dev/null 2>&1 || true
+            # 等旧进程真正释放 8080 端口（最多约 5 秒），否则新 sing-box 绑定会失败
+            for i in $(seq 1 10); do
+              ss -ltn 2>/dev/null | grep -q ':8080 ' || break
+              sleep 0.5
+            done
+            if ss -ltn 2>/dev/null | grep -q ':8080 '; then
+              pkill -9 -f "sing-box run" >/dev/null 2>&1 || true
+              sleep 1
+            fi
+
+            echo "🔧 [$ROLE] 解析代理链接，生成 sing-box 配置..."
+            if ! python3 linktosb.py "$URL" -o singbox.json --port 8080; then
+              echo "❌ [$ROLE] 代理链接解析失败，请检查链接格式。"
+              return 1
+            fi
+
+            echo "🔍 [$ROLE] 检查 sing-box 配置..."
+            if ! ./sing-box check -c singbox.json; then
+              echo "❌ [$ROLE] sing-box 配置检查失败。"
+              return 1
+            fi
+
+            echo "🚀 [$ROLE] 启动 sing-box..."
+            nohup ./sing-box run -c singbox.json > singbox.log 2>&1 &
+            PID=$!
+            sleep 3
+
+            if ! kill -0 "$PID" 2>/dev/null; then
+              echo "❌ [$ROLE] sing-box 启动后异常退出，日志（已打码 IP）如下："
+              tail -n 20 singbox.log | mask_ip
+              return 1
+            fi
+
+            echo "✅ [$ROLE] sing-box 已启动，测试代理连通性..."
+            # 连通性以"非 CF 站点（AWS）"为准，失败再回退 ipify；CF 站点只做信息提示
+            if OUT=$(curl -sS -m 12 --proxy http://127.0.0.1:8080 https://checkip.amazonaws.com) \
+               || OUT=$(curl -sS -m 12 --proxy http://127.0.0.1:8080 https://api.ipify.org); then
+              OUT=$(echo "$OUT" | tr -d '[:space:]')
+              if [ -z "$OUT" ]; then
+                echo "❌ [$ROLE] 代理连接成功，但出口 IP 接口未返回内容。"
+                tail -n 20 singbox.log | mask_ip
+                return 1
+              fi
+              echo "✅ [$ROLE] 出口 IP（非 CF 站点，已脱敏）：$(echo "$OUT" | mask_ip)"
+
+              CF=$(curl -sS -m 10 --proxy http://127.0.0.1:8080 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+              CF_IP=$(echo "$CF" | sed -n 's/^ip=//p' | head -n1 | tr -d '[:space:]')
+              CF_LOC=$(echo "$CF" | sed -n 's/^colo=//p;s/^loc=//p' | tr -d '\r' | paste -sd/ -)
+              if [ -z "$CF_IP" ]; then
+                echo "⚠️ [$ROLE] CF 站点出口 IP 检测失败（仅提示，不影响运行）"
+              else
+                echo "✅ [$ROLE] 出口 IP（CF 站点，已脱敏）：$(echo "$CF_IP" | mask_ip)（$CF_LOC）"
+              fi
+              return 0
+            else
+              CURL_STATUS=$?
+              echo "❌ [$ROLE] 代理连通性测试失败，curl exit code: $CURL_STATUS"
+              tail -n 20 singbox.log | mask_ip
+              return 1
+            fi
+          }
+          SH
+
+          source ./proxy_lib.sh
+          ROLE="主用"
+          if ! start_proxy "主用" "$PROXY_URL"; then
+            if [ -n "$PROXY_URL_BACKUP" ]; then
+              echo "⚠️ 主用代理不可用，切换备用代理..."
+              if start_proxy "备用" "$PROXY_URL_BACKUP"; then
+                ROLE="备用"
+              else
+                echo "❌ 主用与备用代理均不可用。"
+                exit 1
+              fi
+            else
+              echo "❌ 主用代理不可用，且未设置备用代理 PROXY_URL_BACKUP。"
+              exit 1
+            fi
+          fi
+          echo "PROXY_ROLE=$ROLE" >> "$GITHUB_ENV"
+          echo "🧭 当前代理线路：$ROLE"
+
+      - name: ❄️ 每日任务：先续期检查，再 AFK 刷币（有头浏览器 + xvfb）
+        id: renew
+        env:
+          FZ_SESSION: ${{ secrets.FZ_SESSION }}
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          TG_BOT: ${{ secrets.TG_BOT }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          PROXY_URL_BACKUP: ${{ secrets.PROXY_URL_BACKUP }}
+          PANEL_API_KEY: ${{ secrets.PANEL_API_KEY }}
+          PANEL_CRED: ${{ secrets.PANEL_CRED }}
+          AFK_COINS: ${{ (github.event_name == 'workflow_dispatch' && inputs.afk_coins) || '10' }}
+          HEADLESS: "0"
+        run: |
+          # 单次时限随金币目标伸缩：续期 15 分钟 + 每币 60s + 过盾/登录缓冲 10 分钟
+          export MAX_RUN_SECONDS=$((900 + AFK_COINS * 60 + 600))
+
+          run_daily() {
+            PROXY_ROLE="$1" xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24" \
+              python3 -u freezehost_renew.py --daily
+          }
+
+          set +e
+          run_daily "$PROXY_ROLE"
+          RC=$?
+
+          # 退出码 3 = 登录全线失败（cookie+Discord 都不行）——多半是 IP 被限，换线路值得再试
+          # 主用失败 → 切备用代理再试一次（只在设置了备用且当前是主用时触发）
+          if [ "$RC" -ne 0 ] && [ -n "$PROXY_URL" ] && [ -n "$PROXY_URL_BACKUP" ] && [ "$PROXY_ROLE" = "主用" ]; then
+            echo "⚠️ 主用线路任务失败（exit $RC），切换备用代理再试一次..."
+            source ./proxy_lib.sh
+            if start_proxy "备用" "$PROXY_URL_BACKUP"; then
+              echo "PROXY_ROLE=备用" >> "$GITHUB_ENV"
+              run_daily "备用"
+              RC=$?
+            else
+              echo "❌ 备用代理启动失败，保留主用线路的失败结果。"
+            fi
+          fi
+          exit "$RC"
+
+      - name: 📸 上传失败截图（如有）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-fail-screenshots
+          path: |
+            turnstile_fail_*.png
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: 📨 工作流级失败兜底通知
+        if: failure() && steps.renew.outcome != 'failure'
+        env:
+          TG_BOT: ${{ secrets.TG_BOT }}
+        run: |
+          if [ -z "$TG_BOT" ]; then
+            echo "ℹ️ 未设置 TG_BOT，跳过兜底通知。"
+            exit 0
+          fi
+
+          CHAT_ID="${TG_BOT%%,*}"
+          BOT_TOKEN="${TG_BOT#*,}"
+          RUN_TIME=$(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S (北京时间)')
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          MSG=$(printf '%s\n%s\n%s\n%s\n%s' \
+            "❄️ FreezeHost 每日任务通知" \
+            "🕐 运行时间: ${RUN_TIME}" \
+            "🖥 服务器: FreezeHost Free 🇳🇱 (Amsterdam)" \
+            "📊 结果: ❌ 任务失败！" \
+            "📝 原因: 在脚本运行之前（如 sing-box 代理启动/私库拉取阶段）就已失败，脚本内部通知没机会执行，此为工作流级别兜底通知。详情：${RUN_URL}")
+
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            --data-urlencode "text=${MSG}" > /dev/null || true
